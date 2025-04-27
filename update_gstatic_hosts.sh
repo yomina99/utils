@@ -1,18 +1,23 @@
 #!/bin/bash
 set -e # 如果任何命令失败，则立即退出
+#set -x # 取消注释以进行调试
 
 # --- 配置 ---
-DOMAIN_TO_MAP="gstatic.com"
+DOMAINS_TO_MANAGE=(
+    "gstatic.com"
+    "www.gstatic.com"
+    # 在这里添加更多域名
+)
 HOSTS_FILE="/etc/hosts"
-MARKER="# Managed by update_gstatic_hosts for ${DOMAIN_TO_MAP}" # 用于识别脚本管理的行
+BASE_MARKER="# Managed by update_hosts_script"
 TEMP_FILE=$(mktemp)
+FINAL_HOSTS_CONTENT=$(mktemp)
 
 # --- 清理函数 ---
-# 确保临时文件在脚本退出时被删除
 cleanup() {
-  rm -f "$TEMP_FILE"
+  rm -f "$TEMP_FILE" "$FINAL_HOSTS_CONTENT"
 }
-trap cleanup EXIT
+trap cleanup EXIT ERR
 
 # --- 权限检查 ---
 if [ "$(id -u)" -ne 0 ]; then
@@ -23,66 +28,117 @@ fi
 # --- 依赖检查 ---
 if ! command -v dig &> /dev/null; then
     echo "错误: 未找到 'dig' 命令。" >&2
-    echo "正在安装 dnsutils (Debian/Ubuntu) 或 bind-utils (CentOS/Fedora/RHEL)。" >&2
-    apt update && apt install -y dnsutils
-    exit 1
-fi
-
-# --- 获取 IPv4 地址 ---
-echo "正在查询 ${DOMAIN_TO_MAP} 的 IPv4 地址..."
-# 使用 dig 获取 A 记录，并过滤确保是有效的 IPv4 地址
-IPV4_ADDRESSES=$(dig +short "$DOMAIN_TO_MAP" A | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u) # sort -u 去重
-
-if [ -z "$IPV4_ADDRESSES" ]; then
-  echo "错误: 未能解析 ${DOMAIN_TO_MAP} 的 IPv4 地址，或 'dig' 命令失败。" >&2
-  # 决定是否在失败时移除旧条目。这里选择不移除，直接退出。
-  exit 1
-fi
-
-echo "找到的 IPv4 地址:"
-echo "$IPV4_ADDRESSES"
-echo "---"
-
-# --- 更新 /etc/hosts ---
-echo "正在更新 ${HOSTS_FILE}..."
-
-# 1. 从原始 hosts 文件复制不包含我们标记的行到临时文件
-#    这样可以移除上次脚本添加的所有关于 gstatic.com 的条目
-grep -vF "$MARKER" "$HOSTS_FILE" > "$TEMP_FILE" || true # 即使没有匹配也继续
-
-# 2. 将新的映射行（带有标记）追加到临时文件
-#    一个域名可能解析到多个IP，为每个IP都添加一条记录
-ADDED_NEW_LINES=false
-while IFS= read -r IP; do
-  if [ -n "$IP" ]; then # 确保IP不是空行
-    printf "%-16s %s %s\n" "$IP" "$DOMAIN_TO_MAP" "$MARKER" >> "$TEMP_FILE"
-    ADDED_NEW_LINES=true
-  fi
-done <<< "$IPV4_ADDRESSES" # 使用 Here String 将多行 IP 输入循环
-
-# 3. 检查临时文件是否与原文件不同，如果不同则替换
-#    使用 cmp -s 安静地比较文件
-if ! cmp -s "$HOSTS_FILE" "$TEMP_FILE" || [ "$ADDED_NEW_LINES" = false ]; then
-    # 如果文件不同，或者本次未能成功获取IP（导致没有添加新行，需要确保旧行被移除）
-    echo "检测到更改或需要清理旧条目，正在写入新配置..."
-    # 可选：创建时间戳备份
-    # cp "$HOSTS_FILE" "$HOSTS_FILE.bak_$(date +%s)"
-
-    # 使用 mv 替换原文件
-    if mv "$TEMP_FILE" "$HOSTS_FILE"; then
-        # 确保文件权限正确（通常是 644）
-        chmod 644 "$HOSTS_FILE"
-        echo "${HOSTS_FILE} 更新成功。"
-        # 清空 TEMP_FILE 变量，防止 trap 尝试删除已移动的文件
-        TEMP_FILE=""
+    if command -v apt-get &> /dev/null; then
+        echo "正在尝试使用 apt 安装 dnsutils..." >&2 # 输出到 stderr
+        apt-get update && apt-get install -y dnsutils
+    elif command -v yum &> /dev/null; then
+        echo "正在尝试使用 yum 安装 bind-utils..." >&2 # 输出到 stderr
+        yum install -y bind-utils
     else
-        echo "错误: 移动临时文件到 ${HOSTS_FILE} 失败。请检查权限。" >&2
-        # 让 trap 清理未移动的临时文件
+        echo "无法自动安装 'dig'。请手动安装。" >&2
+        exit 1
+    fi
+    if ! command -v dig &> /dev/null; then
+       echo "错误: 安装 'dig' 后仍未找到命令。" >&2
+       exit 1
+    fi
+fi
+
+# --- 函数：解析单个域名并返回 hosts 条目 ---
+# 输入: $1 - 域名
+# 输出 (stdout): 符合 hosts 文件格式的行 (包含标记)
+# 输出 (stderr): 调试/状态信息
+# 返回: 0 表示成功获取IP, 1 表示失败
+resolve_and_format_domain() {
+    local domain="$1"
+    local marker_comment="${BASE_MARKER} for ${domain}"
+    local ipv4_addresses
+    local formatted_lines=""
+    local ip
+
+    # 将调试信息输出到 stderr (>&2)
+    echo "  正在查询 ${domain} 的 IPv4 地址..." >&2
+    ipv4_addresses=$(dig +short "$domain" A | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u)
+
+    if [ -z "$ipv4_addresses" ]; then
+      # 将警告信息输出到 stderr (>&2)
+      echo "  警告: 未能解析 ${domain} 的 IPv4 地址。" >&2
+      return 1 # 返回失败状态
+    fi
+
+    # 将调试信息输出到 stderr (>&2)
+    echo "  找到的 ${domain} 的 IPv4 地址:" >&2
+    echo "$ipv4_addresses" | sed 's/^/    /' >&2 # 缩进输出到 stderr
+
+    while IFS= read -r ip; do
+      if [ -n "$ip" ]; then
+        # 使用 printf 构建要输出到 stdout 的行
+        formatted_lines+=$(printf "%-16s %s %s\n" "$ip" "$domain" "$marker_comment")
+      fi
+    done <<< "$ipv4_addresses"
+
+    # 仅将最终格式化的 hosts 行输出到 stdout
+    echo "$formatted_lines"
+    return 0 # 返回成功状态
+}
+
+# --- 主逻辑 ---
+echo "开始更新 hosts 文件: ${HOSTS_FILE}" >&2 # 输出到 stderr
+
+# 1. 清理旧条目
+echo "正在清理旧的受管理条目..." >&2 # 输出到 stderr
+grep -vF "$BASE_MARKER" "$HOSTS_FILE" > "$FINAL_HOSTS_CONTENT" || {
+    echo "注意: ${HOSTS_FILE} 为空或读取时出错，将创建新文件。" >&2 # 输出到 stderr
+}
+
+# 2. 解析并收集新条目
+echo "正在解析并添加新的域名映射..." >&2 # 输出到 stderr
+ANY_SUCCESS=false
+ALL_RESOLVED_LINES=""
+
+for domain_to_process in "${DOMAINS_TO_MANAGE[@]}"; do
+    # 调用函数，捕获 stdout (hosts 行)，stderr (调试信息) 会直接显示
+    if resolved_lines=$(resolve_and_format_domain "$domain_to_process"); then
+        # 检查捕获的内容是否非空
+        if [ -n "$resolved_lines" ]; then
+            ALL_RESOLVED_LINES+="${resolved_lines}"$'\n'
+            ANY_SUCCESS=true
+        else
+             echo "  注意: 域名 ${domain_to_process} 解析成功但未返回有效 IP 地址或格式化失败。" >&2
+        fi
+    else
+        echo "  处理域名 ${domain_to_process} 失败，跳过。" >&2
+    fi
+done
+
+# 去除可能因换行符产生的尾部空行
+ALL_RESOLVED_LINES=$(echo "$ALL_RESOLVED_LINES" | sed '/^$/d')
+
+# 3. 写入文件 (如果需要)
+if [ "$ANY_SUCCESS" = true ] && [ -n "$ALL_RESOLVED_LINES" ]; then
+    echo "---" >&2
+    echo "将添加以下行到 ${HOSTS_FILE}:" >&2
+    echo "$ALL_RESOLVED_LINES" >&2 # 显示将要添加的内容到 stderr
+    echo "---" >&2
+    # 将所有收集到的新行追加到最终内容文件
+    echo "$ALL_RESOLVED_LINES" >> "$FINAL_HOSTS_CONTENT"
+elif [ "$ANY_SUCCESS" = false ]; then
+     echo "警告: 未能成功解析任何指定的域名。将仅执行清理操作。" >&2
+fi
+
+# 4. 比较并替换
+echo "正在比较文件内容..." >&2 # 输出到 stderr
+if ! cmp -s "$HOSTS_FILE" "$FINAL_HOSTS_CONTENT"; then
+    echo "检测到更改，正在写入新配置..." >&2 # 输出到 stderr
+    if cat "$FINAL_HOSTS_CONTENT" > "$HOSTS_FILE"; then
+        chmod 644 "$HOSTS_FILE"
+        echo "${HOSTS_FILE} 更新成功。" >&2 # 输出到 stderr
+    else
+        echo "错误: 写入 ${HOSTS_FILE} 失败。" >&2
         exit 1
     fi
 else
-    echo "${HOSTS_FILE} 无需更新。"
-    # 让 trap 清理未更改的临时文件
+    echo "${HOSTS_FILE} 无需更新。" >&2 # 输出到 stderr
 fi
 
 exit 0
